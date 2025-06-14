@@ -1,0 +1,219 @@
+import ast
+import os
+import asttokens
+import traceback
+import requests
+import subprocess
+import time
+import platform
+from radon.complexity import cc_visit
+from radon.metrics import mi_visit
+from rich.console import Console
+from rich.table import Table
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+console = Console()
+ollama_process = None
+
+# ─────────────── Dummy ML Model ───────────────
+samples = [
+    "def add(a, b): return a + b",
+    "print(x)",
+    "def unsafe(): os.system('rm -rf /')",
+    "def fail(): if True print('x')"
+]
+y = [0, 1, 1, 1]
+X = [[len(s.splitlines()), len(s), int("os.system" in s)] for s in samples]
+model = Pipeline([("scaler", StandardScaler()), ("clf", RandomForestClassifier())])
+model.fit(X, y)
+
+# ─────────────── Ollama Control ───────────────
+def start_ollama_model(model="codellama"):
+    global ollama_process
+    try:
+        requests.post("http://localhost:11434/api/generate", json={
+            "model": model,
+            "prompt": "ping",
+            "stream": False
+        }, timeout=2)
+        return
+    except:
+        console.print("[yellow]🔄 Starting Ollama in the background...")
+        ollama_process = subprocess.Popen(
+            ["ollama", "run", model],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(10)
+
+def stop_ollama():
+    global ollama_process
+    if ollama_process and ollama_process.poll() is None:
+        console.print("[red]🛑 Stopping Ollama after suggestions...")
+        if platform.system() == "Windows":
+            ollama_process.terminate()
+        else:
+            ollama_process.kill()
+        try:
+            ollama_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            console.print("[bold red]⚠ Could not stop Ollama cleanly.")
+
+# ─────────────── Analysis Functions ───────────────
+def detect_issues(code: str):
+    issues = []
+    lines = code.splitlines()
+    for i, line in enumerate(lines, 1):
+        if "os.system" in line:
+            issues.append({
+                "line": i,
+                "type": "security",
+                "severity": "critical",
+                "message": "Shell command injection risk",
+                "suggestion": "Use subprocess.run instead of os.system"
+            })
+        if line.strip().startswith("def") and '(' in line and ')' in line:
+            fn_name = line.strip().split()[1].split("(")[0]
+            if ":" not in line or len(line.strip()) < 10:
+                issues.append({
+                    "line": i,
+                    "type": "design",
+                    "severity": "warning",
+                    "message": f"Function '{fn_name}' may lack proper structure or docstring",
+                    "suggestion": "Add a docstring to explain the function"
+                })
+    return issues
+
+def get_metrics(code: str):
+    mi_score = mi_visit(code, True)
+    return round(mi_score, 2), ("A" if mi_score >= 85 else "B" if mi_score >= 70 else "C")
+
+def get_complexity(code: str):
+    funcs = cc_visit(code)
+    return [
+        {"name": f.name, "score": f.complexity,
+         "grade": "A" if f.complexity <= 5 else "B" if f.complexity <= 10 else "C"}
+        for f in funcs
+    ]
+
+def ollama_suggestion(code: str):
+    try:
+        res = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "starcoder",
+                "prompt": f"Review this Python code and suggest improvements:\n\n{code}",
+                "stream": False
+            }
+        )
+        return res.json().get("response", "⚠ No response from Ollama.").strip()
+    except Exception as e:
+        return f"⚠ Ollama error: {e}"
+
+def ml_prediction(code: str):
+    x = [[len(code.splitlines()), len(code), int("os.system" in code)]]
+    return model.predict(x)[0]
+
+# ─────────────── Main Analyzer ───────────────
+def analyze_code(code: str, filename="example.py"):
+    start_ollama_model()
+    console.rule(f"[bold blue]\U0001F4CA CodeSense Report for {filename}[/]")
+
+    try:
+        asttokens.ASTTokens(code, parse=True)
+    except SyntaxError as e:
+        line = e.lineno
+        msg = e.msg
+        error_line = code.splitlines()[line - 1] if line <= len(code.splitlines()) else "<line unavailable>"
+        console.rule("\U0001F6AB Syntax Error")
+        console.print(f"[bold red]Line {line}: {msg}")
+        console.print(f"[yellow]>> {error_line}")
+        return
+
+    # 🔍 Static Issue Detection
+    issues = detect_issues(code)
+    if issues:
+        console.print("\n[bold]\U0001F50D Detected Issues")
+        table = Table(show_lines=True)
+        table.add_column("Line", style="cyan", justify="right")
+        table.add_column("Type", style="bold yellow")
+        table.add_column("Severity", style="red")
+        table.add_column("Message", style="white")
+        table.add_column("Suggestion", style="green")
+        for issue in issues:
+            table.add_row(
+                str(issue["line"]),
+                issue["type"],
+                issue["severity"],
+                issue["message"],
+                issue["suggestion"]
+            )
+        console.print(table)
+    else:
+        console.print("[green]\u2705 No static issues found.")
+
+    # 📈 Maintainability
+    score, grade = get_metrics(code)
+    console.print(f"\n\U0001F4C8 Maintainability Index: {score} ({grade})")
+
+    # 📊 Cyclomatic Complexity
+    complexity = get_complexity(code)
+    if complexity:
+        table = Table(title="Function Complexity")
+        table.add_column("Function")
+        table.add_column("Score", justify="right")
+        table.add_column("Grade", justify="center")
+        for f in complexity:
+            table.add_row(f["name"], str(f["score"]), f["grade"])
+        console.print(table)
+
+    # 🧠 ML Prediction
+    ml_result = ml_prediction(code)
+    console.print("\n\U0001F9E0 ML Bug Prediction: ", end="")
+    if ml_result:
+        console.print("[red]\u274C Potential bug detected")
+        flagged = False
+        for i, line in enumerate(code.splitlines(), 1):
+            if any(token in line for token in ["os.system", "exec(", "eval(", "print(x)"]):
+                flagged = True
+                console.print(f"[white]{i:3d}: {line}")
+                console.print("[red]    \u26A0 ML flagged this line as risky\n")
+        if not flagged:
+            console.print("[yellow]\u26A0 ML detected risk but no specific line matched known patterns.")
+    else:
+        console.print("[green]\u2705 Looks safe")
+
+    # ⚙ Runtime Check
+    try:
+        exec(code, {})
+        console.print("⚙ Runtime Check: [green]\u2705 No runtime errors")
+    except Exception as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        if tb:
+            last = tb[-1]
+            lineno = last.lineno
+            error_line = code.splitlines()[lineno - 1] if lineno <= len(code.splitlines()) else "<line unavailable>"
+            console.print(f"⚙ Runtime Check: [red]\u274C {type(e).__name__} on line {lineno}: {e}")
+            console.print(f"[yellow]\u27A1\uFE0F  Error occurred at:\n[white]{lineno:3d}: {error_line}")
+            console.print(f"[red]    \u26A0 Runtime error explanation: {e}\n")
+        else:
+            console.print(f"⚙ Runtime Check: [red]\u274C {type(e).__name__}: {e}")
+
+    # 💡 Ollama Suggestions
+    console.rule("\U0001F4A1 AI Suggestions (Ollama)")
+    suggestion = ollama_suggestion(code)
+    for line in suggestion.split("\n"):
+        console.print(f"- {line.strip()}")
+    stop_ollama()
+
+# ─────────────── Entry Point ───────────────
+if __name__ == "__main__":
+    filepath = "example.py"
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            code = f.read()
+        analyze_code(code, filename=filepath)
+    else:
+        console.print(f"[bold red]\u274C File '{filepath}' not found.")
