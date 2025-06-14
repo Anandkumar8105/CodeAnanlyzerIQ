@@ -1,0 +1,181 @@
+import ast
+import os
+import asttokens
+import traceback
+import openai
+from radon.complexity import cc_visit
+from radon.metrics import mi_visit
+from rich.console import Console
+from rich.table import Table
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+console = Console()
+openai.api_key = "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"
+
+# ─────────────── Dummy ML Model ───────────────
+samples = [
+    "def add(a, b): return a + b",
+    "print(x)",
+    "def unsafe(): os.system('rm -rf /')",
+    "def fail(): if True print('x')"
+]
+y = [0, 1, 1, 1]
+X = [[len(s.splitlines()), len(s), int("os.system" in s)] for s in samples]
+model = Pipeline([("scaler", StandardScaler()), ("clf", RandomForestClassifier())])
+model.fit(X, y)
+
+# ─────────────── Analysis Functions ───────────────
+def detect_issues(code: str):
+    issues = []
+    lines = code.splitlines()
+    for i, line in enumerate(lines, 1):
+        if "os.system" in line:
+            issues.append({
+                "line": i,
+                "type": "security",
+                "severity": "critical",
+                "message": "Shell command injection risk",
+                "suggestion": "Use subprocess.run instead of os.system"
+            })
+        if line.strip().startswith("def") and '(' in line and ')' in line:
+            fn_name = line.strip().split()[1].split("(")[0]
+            if ":" not in line or len(line.strip()) < 10:
+                issues.append({
+                    "line": i,
+                    "type": "design",
+                    "severity": "warning",
+                    "message": f"Function '{fn_name}' may lack proper structure or docstring",
+                    "suggestion": "Add a docstring to explain the function"
+                })
+    return issues
+
+def get_metrics(code: str):
+    mi_score = mi_visit(code, True)
+    return round(mi_score, 2), ("A" if mi_score >= 85 else "B" if mi_score >= 70 else "C")
+
+def get_complexity(code: str):
+    funcs = cc_visit(code)
+    return [
+        {"name": f.name, "score": f.complexity,
+         "grade": "A" if f.complexity <= 5 else "B" if f.complexity <= 10 else "C"}
+        for f in funcs
+    ]
+
+def gpt_suggestion(code: str):
+    try:
+        res = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful Python code reviewer."},
+                {"role": "user", "content": f"Give helpful suggestions for improving this code:\n\n{code}"}
+            ]
+        )
+        return res['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        return f"OpenAI Error: {e}"
+
+def ml_prediction(code: str):
+    x = [[len(code.splitlines()), len(code), int("os.system" in code)]]
+    return model.predict(x)[0]
+
+# ─────────────── Main Analyzer ───────────────
+def analyze_code(code: str, filename="example.py"):
+    console.rule(f"[bold blue]📊 CodeSense Report for {filename}[/]")
+
+    try:
+        asttokens.ASTTokens(code, parse=True)
+    except SyntaxError as e:
+        line = e.lineno
+        msg = e.msg
+        error_line = code.splitlines()[line - 1] if line <= len(code.splitlines()) else "<line unavailable>"
+        console.rule("🚫 Syntax Error")
+        console.print(f"[bold red]Line {line}: {msg}")
+        console.print(f"[yellow]>> {error_line}")
+        return
+
+    # 🔍 Static Issue Detection
+    issues = detect_issues(code)
+    if issues:
+        console.print("\n[bold]🔍 Detected Issues")
+        table = Table(show_lines=True)
+        table.add_column("Line", style="cyan", justify="right")
+        table.add_column("Type", style="bold yellow")
+        table.add_column("Severity", style="red")
+        table.add_column("Message", style="white")
+        table.add_column("Suggestion", style="green")
+        for issue in issues:
+            table.add_row(
+                str(issue["line"]),
+                issue["type"],
+                issue["severity"],
+                issue["message"],
+                issue["suggestion"]
+            )
+        console.print(table)
+    else:
+        console.print("[green]✅ No static issues found.")
+
+    # 📈 Maintainability
+    score, grade = get_metrics(code)
+    console.print(f"\n📈 Maintainability Index: {score} ({grade})")
+
+    # 📊 Cyclomatic Complexity
+    complexity = get_complexity(code)
+    if complexity:
+        table = Table(title="Function Complexity")
+        table.add_column("Function")
+        table.add_column("Score", justify="right")
+        table.add_column("Grade", justify="center")
+        for f in complexity:
+            table.add_row(f["name"], str(f["score"]), f["grade"])
+        console.print(table)
+
+    # 🧠 ML Prediction
+    ml_result = ml_prediction(code)
+    console.print("\n🧠 ML Bug Prediction: ", end="")
+    if ml_result:
+        console.print("[red]❌ Potential bug detected")
+        flagged = False
+        for i, line in enumerate(code.splitlines(), 1):
+            if any(token in line for token in ["os.system", "exec(", "eval(", "print(x)"]):
+                flagged = True
+                console.print(f"[white]{i:3d}: {line}")
+                console.print(f"[red]    ⚠ ML flagged this line as risky\n")
+        if not flagged:
+            console.print("[yellow]⚠ ML detected risk but no specific line matched known patterns.")
+    else:
+        console.print("[green]✅ Looks safe")
+
+    # ⚙ Runtime Check
+    try:
+        exec(code, {})
+        console.print("⚙ Runtime Check: [green]✅ No runtime errors")
+    except Exception as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        if tb:
+            last = tb[-1]
+            lineno = last.lineno
+            error_line = code.splitlines()[lineno - 1] if lineno <= len(code.splitlines()) else "<line unavailable>"
+            console.print(f"⚙ Runtime Check: [red]❌ {type(e).__name__} on line {lineno}: {e}")
+            console.print(f"[yellow]➡️  Error occurred at:\n[white]{lineno:3d}: {error_line}")
+            console.print(f"[red]    ⚠ Runtime error explanation: {e}\n")
+        else:
+            console.print(f"⚙ Runtime Check: [red]❌ {type(e).__name__}: {e}")
+
+    # 💡 GPT Suggestions
+    console.rule("💡 GPT Suggestions")
+    suggestion = gpt_suggestion(code)
+    for line in suggestion.split("\n"):
+        console.print(f"- {line.strip()}")
+
+# ─────────────── Entry Point ───────────────
+if __name__ == "__main__":
+    filepath = "example.py"
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            code = f.read()
+        analyze_code(code, filename=filepath)
+    else:
+        console.print(f"[bold red]❌ File '{filepath}' not found.")
